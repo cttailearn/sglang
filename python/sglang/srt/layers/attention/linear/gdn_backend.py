@@ -2,7 +2,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -53,6 +52,27 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+
+
+# ---------------------------------------------------------------------------
+# 方案 1 融合：在 CUDA 上，可选用一份把 `g` 的 L2 归一化融合进 gating
+# kernel 本身的 Triton kernel。
+#
+# 本开关由环境变量 ``SGLANG_FUSE_GDN_GATING`` 控制，**默认行为不变**。
+# 设置为 ``1`` 即可启用。
+#
+# kernel 实现请见
+# ``sglang/srt/layers/attention/fla/fused_gdn_gating_v2.py``，
+# 设计说明请见对应文档。
+# ---------------------------------------------------------------------------
+if is_cuda() and __import__("os").getenv("SGLANG_FUSE_GDN_GATING", "0") == "1":
+    from sglang.srt.layers.attention.fla.fused_gdn_gating_v2 import (
+        fused_gdn_gating,
+    )
+else:
+    from sglang.srt.layers.attention.fla.fused_gdn_gating import (
+        fused_gdn_gating,
+    )
 
 
 class GDNKernelDispatcher:

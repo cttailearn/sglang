@@ -117,6 +117,7 @@ Its core features include:
    developer_guide/benchmark_and_profiling.md
    developer_guide/bench_serving.md
    developer_guide/evaluating_new_models.md
+   developer_guide/fused_gdn_gating_v2_plan1.md
 
 .. toctree::
    :maxdepth: 1

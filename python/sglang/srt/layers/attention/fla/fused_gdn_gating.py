@@ -4,6 +4,12 @@ import torch
 import triton
 import triton.language as tl
 
+# 方案 1 融合：把对 `g` 的 L2 归一化融合进 gating kernel 本身的更快
+# 版本位于 ``fused_gdn_gating_v2``。该版本**不是默认** —— backend
+# 在运行时根据 ``SGLANG_FUSE_GDN_GATING`` 环境变量决定走哪一份。
+# kernel 实现请见 ``sglang/srt/layers/attention/fla/fused_gdn_gating_v2.py``，
+# 设计说明请见仓库 ``docs/developer_guide/fused_gdn_gating_v2_plan1.md``。
+
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 # beta_output = b.sigmoid()
