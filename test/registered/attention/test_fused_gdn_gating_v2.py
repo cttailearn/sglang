@@ -55,18 +55,28 @@ def _make_inputs(batch, num_heads, device="cuda", dtype=torch.bfloat16, seed=0):
 @pytest.mark.parametrize("batch", [1, 8, 32])
 @pytest.mark.parametrize("num_heads", [16, 32, 64, 128])
 def test_v2_g_beta_match_v1(batch, num_heads):
-    """v2 的 ``(g, beta)`` 输出必须与 v1 一致（kernel 计算逻辑相同）。"""
+    """v2 的 ``(g, beta)`` 输出必须与 v1 一致（kernel 计算逻辑相同）。
+
+    容差说明
+    --------
+    * ``g`` 在 v1 / v2 中都以 fp32 写出，两份 kernel 计算逻辑相同，
+      应当 bit-identical，因此用 fp32 级容差 ``1e-5``。
+    * ``beta`` 在 v1 / v2 中都以 bf16 写出。Triton 编译器会为不同
+      kernel 结构生成不同的 SASS，导致 ``sigmoid(blk_b.to(fp32))`` 的
+      末位有微小差异，cast 回 bf16 时可能差 1 ULP。bf16 在 1.0 附近
+      的 ULP 为 ``2**-7 ≈ 7.8e-3``，所以容差设为 ``5e-3``（约 0.6 ULP）。
+    """
     A_log, a, b, dt_bias = _make_inputs(batch, num_heads)
 
     g1, beta1 = fused_gdn_gating_v1(A_log, a, b, dt_bias)
     g2, beta2 = fused_gdn_gating_v2(A_log, a, b, dt_bias)
 
-    # 两个 kernel 在写回前都 cast 到 fp32，所以比较在 fp32 下进行。
-    # 允许极小的容差，以容纳编译器可能做的运算重排。
+    # g 是 fp32 输出，应 bit-identical。
     assert torch.allclose(g1, g2, atol=1e-5, rtol=1e-5), (
         f"g 不一致：最大差 = {(g1 - g2).abs().max().item()}"
     )
-    assert torch.allclose(beta1, beta2, atol=1e-5, rtol=1e-5), (
+    # beta 是 bf16 输出，容差放宽到 bf16 ULP 量级。
+    assert torch.allclose(beta1, beta2, atol=5e-3, rtol=5e-3), (
         f"beta 不一致：最大差 = {(beta1 - beta2).abs().max().item()}"
     )
 
@@ -75,7 +85,11 @@ def test_v2_g_beta_match_v1(batch, num_heads):
 @pytest.mark.parametrize("batch", [1, 8, 32])
 @pytest.mark.parametrize("num_heads", [16, 32, 64, 128])
 def test_v2_g_norm_matches_reference(batch, num_heads):
-    """v2 的 ``g_norm`` 必须与独立的 ``l2norm`` 参考实现一致。"""
+    """v2 的 ``g_norm`` 必须与独立的 ``l2norm`` 参考实现一致。
+
+    同时附带一个 L2 范数的健全性检查：``g_norm`` 的 L2 范数应该
+    约等于 1（即确实是「归一化」过的，不是 RMSNorm）。
+    """
     A_log, a, b, dt_bias = _make_inputs(batch, num_heads)
 
     g_v1, beta_v1 = fused_gdn_gating_v1(A_log, a, b, dt_bias)
@@ -84,10 +98,17 @@ def test_v2_g_norm_matches_reference(batch, num_heads):
     # 先验证 g / beta 与 v1 参考一致。
     assert torch.allclose(g_v1, g_ref, atol=1e-5, rtol=1e-5)
 
-    # 再把 g_norm 与参考 l2norm 比较。
+    # 把 g_norm 与参考 l2norm 比较。
     g_norm_ref = l2norm(g_v1)
     diff = (g_norm_ref - g_norm_v2).abs().max().item()
     assert diff < 1e-4, f"g_norm 最大差 = {diff}"
+
+    # 健全性检查：L2 归一化后，``sum(g_norm ** 2) ≈ 1``（每个行）。
+    # 如果该值 ≈ 1/N，则是 RMSNorm 而不是 L2 norm（曾经的 bug 现象）。
+    sumsq = (g_norm_v2 * g_norm_v2).sum(dim=-1)  # (B,)
+    assert torch.allclose(sumsq, torch.ones_like(sumsq), atol=1e-3), (
+        f"g_norm 不是 L2 归一化：sum(g_norm^2) 应 ≈ 1，实际 = {sumsq.tolist()}"
+    )
 
 
 # ---------------------------------------------------------------------------

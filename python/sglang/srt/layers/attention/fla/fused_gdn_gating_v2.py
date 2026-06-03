@@ -108,9 +108,12 @@ def _fused_gdn_gating_l2norm_kernel(
     # 可选：对 g 做 L2 归一化
     # ------------------------------------------------------------------
     if RETURN_G_NORM:
-        # 数值稳定的 L2 归一化：rsqrt(mean(g^2) + eps)。
-        # 显式 cast 到 fp32（blk_g 已经是 fp32）。
-        var = tl.sum(blk_g * blk_g, axis=0) / NUM_HEADS
+        # L2 归一化：``y = x / sqrt(sum(x^2) + eps)``。
+        # 注意：这里**不**除以 NUM_HEADS——那是 RMSNorm，不是 L2 norm。
+        # 必须与 ``sglang.srt.layers.attention.fla.l2norm.l2norm_fwd`` 保持
+        # 严格一致，否则下游 chunk / recurrent kernel 收到的
+        # ``g_norm`` 会差 sqrt(N) 倍。
+        var = tl.sum(blk_g * blk_g, axis=0)
         rstd = 1.0 / tl.sqrt(var + eps)
         blk_g_norm = blk_g * rstd
     else:

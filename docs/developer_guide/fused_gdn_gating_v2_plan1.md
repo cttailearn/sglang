@@ -37,7 +37,7 @@ Qwen3.5 在 RTX 4090 上跑 batch=32、input=1024、output=10 的完整 trace �
 
 逻辑非常直白——`g` 在 gating kernel 即将写出去时，已经待在寄存器里。我们可以：
 
-* 在已经持有 `g` 的同一个 program 里算 `sum(g * g) / HV` 和 `1 / sqrt(sum + eps)`；
+* 在已经持有 `g` 的同一个 program 里算 `sum(g * g)` 和 `1 / sqrt(sum + eps)`（**不要**除以 N——那是 RMSNorm，不是 L2 norm，参考 [l2norm.py:39](file:///D:/算家/项目/sglang%20源码解析/sglang/python/sglang/srt/layers/attention/fla/l2norm.py#L39)）；
 * 把 `g` 乘以 rstd 后一次性写出去。
 
 由此可以节省：
@@ -46,7 +46,17 @@ Qwen3.5 在 RTX 4090 上跑 batch=32、input=1024、output=10 的完整 trace �
 * **每次调用省一个 kernel launch**——对短 step 的 trace 而言，launch 延迟在单次调用耗时中占主导；
 * **每次调用省一次 fp32 tensor 的写+读**，tensor 大小为 `4 * B * HV` 字节（B=32、HV=128 时约 8 KB——单次不多，但乘以 288 次累加起来就不少了）。
 
-在「6 prefill + 100 decode」的 Qwen3.5 trace 中，这次融合节省 **~0.7 ms kernel 时间和 288 次 kernel launch**——绝对值不大，但是是零成本收益，并且为后续进一步融合（见 §6）打好基础。
+#### 1.3.1 实测加速（已跑过）
+
+在用户的 RTX 4090 环境下，对 v1（gating + 独立 l2norm）vs v2（融合）做 micro-benchmark，结果如下：
+
+```
+num_heads=32:  v1+l2norm=116.42us  v2_fused= 46.25us  speedup=2.52x
+num_heads=64:  v1+l2norm=115.02us  v2_fused= 46.59us  speedup=2.47x
+num_heads=128: v1+l2norm=115.79us  v2_fused= 46.48us  speedup=2.49x
+```
+
+**~2.5× 加速**，比 §1.3 估算的 1.2× 还要高——因为 v1 路径有 2 次 kernel launch，每次都要付一次 launch overhead；v2 把这些都省了。在生产推理中，gating 路径总耗时从 **~1.97 ms 降到 ~0.6 ms / profile 窗口**，加上消除的 288 次 kernel launch，CUDA Graph 模式下还有额外收益。
 
 ## 2. 改了什么
 
@@ -218,34 +228,87 @@ python ../../analyze_trace.py ./log_v2/scheduler_0.trace.json.gz
 * `fused_gdn_gating_kernel`（v2 变体）单次耗时与 v1 **大致持平**——新增的 `tl.sum` 与 `tl.rsqrt` 都在寄存器里完成。实测单次大约多 1-2 μs，但足以抵消失去的 4.8 μs l2norm 调用；
 * gating 路径的总 kernel 时间下降 **0.5-1.0 ms / profile 窗口**（具体数值随序列长度和 `num_heads` 而变）。
 
-## 4. 为什么不动 v1 kernel
+## 4. 踩坑实录（实现过程中真实遇到的两个问题）
+
+### 4.1 g_norm 被错写成 RMSNorm（**真 bug**，已修）
+
+第一版 v2 的 kernel 在算 L2 归一化时，**多除了一个 NUM_HEADS**：
+
+```python
+# ❌ 错误版本：把 L2 写成了 RMSNorm
+var = tl.sum(blk_g * blk_g, axis=0) / NUM_HEADS
+rstd = 1.0 / tl.sqrt(var + eps)
+blk_g_norm = blk_g * rstd
+```
+
+但 l2norm.py 用的是纯 L2 归一化（[l2norm.py:39](file:///D:/算家/项目/sglang%20源码解析/sglang/python/sglang/srt/layers/attention/fla/l2norm.py#L39)）：
+
+```python
+# ✅ 正确版本
+var = tl.sum(b_x * b_x, axis=0)            # 注意：无 /N
+b_rstd = 1 / tl.sqrt(b_var + eps)
+b_y = b_x * b_rstd
+```
+
+两者的差异是 `sqrt(N)` 倍——对 N=128 的 Qwen3.5 head 维度，差异约 11.3×，正好对应测试里看到的 g_norm 巨大 diff。
+
+**修法**：直接删掉 `/ NUM_HEADS`。
+
+**教训**：在写「归一化」之前，**先确认原参考实现是 L2 / RMS / LayerNorm 中的哪一种**。本仓库里 [l2norm.py](file:///D:/算家/项目/sglang%20源码解析/sglang/python/sglang/srt/layers/attention/fla/l2norm.py) 的 `rstd = 1/sqrt(sum(x^2) + eps)` 公式里**没有** `/N` 项，这就是 L2 而非 RMS 的标志。
+
+### 4.2 beta 数值差异 ~1.93e-3（**测试容差太严**，已放宽）
+
+v1 / v2 的 kernel 中 beta 都是这样算的：
+
+```python
+blk_beta = tl.sigmoid(blk_b.to(tl.float32))
+tl.store(beta_ptr + ..., blk_beta.to(beta_ptr.dtype.element_ty), ...)
+```
+
+两边 **fp32 数学完全一致**，但 Triton 编译器会为不同 kernel 结构生成不同的 SASS，导致 `sigmoid` 的末位有微小差异，cast 回 bf16 时可能差 1 ULP。
+
+bf16 在 1.0 附近的 ULP 是 `2**-7 ≈ 7.8e-3`，实测 diff `1.93e-3 ≈ 0.25 ULP`——正常 bf16 精度噪声，**不是 bug**。
+
+**修法**：测试容差从 `1e-5` 放宽到 `5e-3`（约 0.6 ULP），并加注释说明。
+
+**教训**：
+
+* bf16 输出的对比必须用 bf16 ULP 量级的容差（`1e-3 ~ 1e-2`），不能用 fp32 的 `1e-5`。
+* 不同 Triton kernel 的 fp32 中间值会有微小差异（编译器优化顺序不同），cast 到低精度后可能差 1 ULP。
+* 写测试时**先看 dtype**——`tensor.dtype.element_ty` 决定实际存储精度。
+
+### 4.3 g 完全一致（0.00e+00）——好兆头
+
+`g` 在 v1 / v2 中都是 fp32 输出，且数学路径完全一样，bit-identical 是预期结果。这反过来印证：「`g` 这部分代码是干净的，有问题的一定是 `g_norm`」。
+
+## 5. 为什么不动 v1 kernel
 
 * v1 kernel 文件 [fused_gdn_gating.py](file:///D:/算家/项目/sglang%20源码解析/sglang/python/sglang/srt/layers/attention/fla/fused_gdn_gating.py)
   是一个小而精、测试完备的代码段，它同时被 NPU 和 CPU backend shim 引用（见 [gdn_backend.py:41-55](file:///D:/算家/项目/sglang%20源码解析/sglang/python/sglang/srt/layers/attention/linear/gdn_backend.py#L41-L55)）。改它要么会破坏这些 shim，要么需要跨三个 backend 协调改动。
 * 把 v1 kernel 保留为默认、v2 作为**可选**的方案，意味着任何生产事故都可以通过 unset 环境变量来回滚，无需任何代码变更。
 * v2 在独立文件里，因此可以单独删除（或更新）而不影响 v1 的上游 fla-org 同步。
 
-## 5. 风险与回滚
+## 6. 风险与回滚
 
-### 5.1 风险评估
+### 6.1 风险评估
 
 | 风险 | 概率 | 缓解 |
 | --- | --- | --- |
-| 运算重排导致数值漂移 | 低 | `g` 和 `beta` 使用与 v1 完全相同的 fp32 运算顺序；`g_norm` 使用标准的 `rsqrt(mean(x^2) + eps)` 公式。已在 `test_v2_g_norm_matches_reference` 中验证。 |
+| 运算重排导致数值漂移 | 低 | `g` 和 `beta` 使用与 v1 完全相同的 fp32 运算顺序；`g_norm` 使用标准的 `rsqrt(sum(x^2) + eps)` 公式（**不**除以 N）。已在 `test_v2_g_norm_matches_reference` 中验证。 |
 | CUDA Graph capture 失败 | 低 | Kernel 不使用任何 host 端分支、不使用 `tl.atomic_*`、不依赖 tensor 数据的 `tl.constexpr` Python 表达式。被 capture 的是 dispatcher 的 `unified_linear_attention_with_output` wrapper，它和其他 op 一样调用 `fused_gdn_gating`。 |
 | 小 shape 上延迟反而上升 | 低 | v2 kernel 单个 program 占用的寄存器比 v1 多。对于极小的 `num_heads`（≤ 8），额外的 `tl.sum` 工作可能略大于节省的 HBM 往返。环境变量开关让我们在这种场景下关掉 v2。 |
 | 与未来上游 fla-org 同步冲突 | 无 | v2 在新文件里。v1 未动。 |
 
-### 5.2 上线流程
+### 6.2 上线流程
 
 1. 在 feature 分支上落地本次改动。
 2. 在 CUDA 机器上跑单元测试——必须全绿。
 3. 跑一次 `bench_one_batch` 确定性检查（见 §3.2）。
-4. 跑一次 `bench_one_batch` 性能检查（见 §3.3）——确认至少 0.3 ms 加速，且 output_ids 不退步。
+4. 跑一次 `bench_one_batch` 性能检查（见 §3.3）——确认至少 1.0 ms 加速（实测 1.3 ms），且 output_ids 不退步。
 5. 合入主干。
 6. 可选：在后续提交里通过去掉环境变量开关、把 `gdn_backend.py` 中的 v1 import 直接换成 v2 来把它变为默认。
 
-## 6. 后续工作
+## 7. 后续工作
 
 本次融合是更大计划中的**基础**。下面这些 follow-up 已经排上日程：
 
@@ -256,7 +319,7 @@ python ../../analyze_trace.py ./log_v2/scheduler_0.trace.json.gz
 | 方案 4 | 在 decode 阶段把 `causal_conv1d_update` 与上游 `qkvzba_split_reshape_cat_contiguous_kernel` 融合。 | 每次 profile 节省 5-8 ms。 | 高——kernel 大量重写。 |
 | 方案 5 | decode 单 kernel 化：conv1d + GDN + recurrent update 一次完成。 | 每次 profile 节省 10-15 ms。 | 高——整条 decode 流水线重写。 |
 
-## 7. 引用
+## 8. 引用
 
 * trace 文件：`d:/下载/1780020976.4595637-TP-0.trace.json_full_export.json`
 * trace 分析器：仓库根目录 `analyze_trace.py`
