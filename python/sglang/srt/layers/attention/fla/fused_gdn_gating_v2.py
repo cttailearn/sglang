@@ -68,22 +68,28 @@ def _fused_gdn_gating_l2norm_kernel(
     beta: tl.constexpr,
     threshold: tl.constexpr,
     eps: tl.constexpr,
-    BLK_HEADS: tl.constexpr,
     RETURN_G_NORM: tl.constexpr,
 ):
     """单遍完成 gating + L2 归一化的融合 kernel。
 
-    每个 program 处理大小为 ``BLK_HEADS`` 的 ``(batch, head_block)``
-    块。Kernel 一次性读取 ``A_log``、``a``、``b``、``dt_bias``，在
-    寄存器内计算 ``g``、``beta`` 以及（可选的）L2 归一化后的
-    ``g_norm``，然后把三者都写出——期间 ``g`` 永远不写回 HBM，这正是
-    我们想要的效果。
+    每个 program 处理**整行**（同一 batch 的全部 NUM_HEADS 个 head），
+    保证 L2 归一化的求和覆盖整行。Kernel 一次性读取
+    ``A_log``、``a``、``b``、``dt_bias``，在寄存器内计算 ``g``、
+    ``beta`` 以及（可选的）L2 归一化后的 ``g_norm``，然后把三者都
+    写出——期间 ``g`` 永远不写回 HBM，这正是我们想要的效果。
+
+    设计要点
+    --------
+    * **整行归约**——之前一版用 ``BLK_HEADS`` tiling，会让 L2 norm
+      变成「8 个 head 子集」的归一化，与 ``l2norm.l2norm_fwd`` 不一致。
+      现在每个 program 负责整行，所有 head 维都进入同一个
+      ``tl.sum(... axis=0)``。
+    * **NUM_HEADS 必须是 2 的幂**——``tl.arange(0, NUM_HEADS)`` 要求
+      这一点。Qwen3.5 的 ``num_heads`` 是 16/32/64/128，都满足。
     """
     i_b = tl.program_id(0)
-    i_d = tl.program_id(1)
-
-    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
-    mask = head_off < NUM_HEADS
+    head_off = tl.arange(0, NUM_HEADS)
+    mask = head_off < NUM_HEADS  # 当 NUM_HEADS 是 2 的幂时，恒为 True
 
     # ------------------------------------------------------------------
     # 加载输入
@@ -109,6 +115,9 @@ def _fused_gdn_gating_l2norm_kernel(
     # ------------------------------------------------------------------
     if RETURN_G_NORM:
         # L2 归一化：``y = x / sqrt(sum(x^2) + eps)``。
+        # 关键：这里的求和必须覆盖**整行**（所有 NUM_HEADS 个元素），
+        # 而不是 ``BLK_HEADS`` 个元素的子集。整行求和会让
+        # ``sum(g_norm ** 2) == 1``（每个 batch）。
         # 注意：这里**不**除以 NUM_HEADS——那是 RMSNorm，不是 L2 norm。
         # 必须与 ``sglang.srt.layers.attention.fla.l2norm.l2norm_fwd`` 保持
         # 严格一致，否则下游 chunk / recurrent kernel 收到的
@@ -165,10 +174,22 @@ def fused_gdn_gating_with_l2norm(
     stride_a = a.stride(0)
     stride_b = b.stride(0)
 
-    # BLK_HEADS=8 是 head_dim 在 [32, 128] 区间（Qwen3.5：16/32/64/128 个
-    # head × 64/128 head_dim）下的甜点。
-    BLK_HEADS = 8
-    grid = (batch, triton.cdiv(num_heads, BLK_HEADS))
+    # 整行归约：每个 program 处理一个 batch 的全部 NUM_HEADS 个 head。
+    # 网格大小 = batch；每个 program 的工作量 = NUM_HEADS。
+    # 与之前 v1 的「(batch, cdiv(NUM_HEADS, 8))」相比，program 数量
+    # 减少为 1/8~1/16，但每个 program 的工作量相应增加。
+    grid = (batch,)
+
+    # num_warps 与 NUM_HEADS 匹配：每线程处理 1 个 head 维。
+    # NUM_HEADS=128 → 4 warps；NUM_HEADS=64 → 2 warps；以此类推。
+    if num_heads >= 128:
+        num_warps = 4
+    elif num_heads >= 64:
+        num_warps = 2
+    elif num_heads >= 32:
+        num_warps = 1
+    else:
+        num_warps = 1
 
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_out = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
@@ -193,9 +214,8 @@ def fused_gdn_gating_with_l2norm(
         beta,
         threshold,
         eps,
-        BLK_HEADS,
         RETURN_G_NORM=return_g_norm,
-        num_warps=1,
+        num_warps=num_warps,
     )
     return g, beta_out, (g_norm if return_g_norm else None)
 
