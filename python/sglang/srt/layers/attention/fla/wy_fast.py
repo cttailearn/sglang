@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -19,6 +20,17 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 #     ],
 #     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
 # )
+@triton.heuristics(
+    {
+        # 方案 1.5：开启 in-kernel K L2 归一化时，把 BK 强制为
+        # next_power_of_2(K)；否则保持默认 BK=64。
+        "BK": lambda args: (
+            max(64, triton.next_power_of_2(args["K"]))
+            if args.get("USE_K_L2NORM_IN_KERNEL", False)
+            else 64
+        ),
+    }
+)
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(
     k,
@@ -39,6 +51,7 @@ def recompute_w_u_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_K_L2NORM_IN_KERNEL: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -103,6 +116,15 @@ def recompute_w_u_fwd_kernel(
             (1, 0),
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
+        # 方案 1.5：in-kernel K L2 归一化。BK heuristic 已保证
+        # USE_K_L2NORM_IN_KERNEL=True 时 BK == K，一次 tl.load 即可
+        # 拿到整行。
+        if USE_K_L2NORM_IN_KERNEL:
+            b_k_f32 = b_k.to(tl.float32)
+            b_k = (
+                b_k_f32
+                / tl.sqrt(tl.sum(b_k_f32 * b_k_f32, axis=1, keep_dims=True) + 1e-6)
+            ).to(b_k.dtype)
         b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
         b_w = tl.dot(b_A, b_kb)
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
@@ -124,8 +146,8 @@ def recompute_w_u_fwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = 64
     BV = 64
+    use_k_l2norm = os.getenv("SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL", "0") == "1"
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
@@ -144,9 +166,9 @@ def recompute_w_u_fwd(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
+        USE_K_L2NORM_IN_KERNEL=use_k_l2norm,
         num_warps=4,
         num_stages=3,
     )

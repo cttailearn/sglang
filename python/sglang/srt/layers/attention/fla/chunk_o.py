@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 from typing import Optional
 
 import torch
@@ -26,6 +27,17 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 #     ],
 #     key=["H", "K", "V", "BT"],
 # )
+@triton.heuristics(
+    {
+        # 方案 1.5：开启 in-kernel Q/K L2 归一化时，把 BK 强制为
+        # next_power_of_2(K)，否则保留默认 BK=128。
+        "BK": lambda args: (
+            max(128, triton.next_power_of_2(args["K"]))
+            if args.get("USE_QK_L2NORM_IN_KERNEL", False)
+            else 128
+        ),
+    }
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,
@@ -47,6 +59,7 @@ def chunk_fwd_kernel_o(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -93,6 +106,21 @@ def chunk_fwd_kernel_o(
         # [BV, BK]
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
+        # 方案 1.5：in-kernel Q/K L2 归一化。BK heuristic 已保证
+        # USE_QK_L2NORM_IN_KERNEL=True 时 BK == K，一次 tl.load 即可
+        # 拿到整行。
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q_f32 = b_q.to(tl.float32)
+            b_q = (
+                b_q_f32
+                / tl.sqrt(tl.sum(b_q_f32 * b_q_f32, axis=1, keep_dims=True) + 1e-6)
+            ).to(b_q.dtype)
+            b_k_f32 = b_k.to(tl.float32)
+            b_k = (
+                b_k_f32
+                / tl.sqrt(tl.sum(b_k_f32 * b_k_f32, axis=0, keep_dims=True) + 1e-6)
+            ).to(b_k.dtype)
+
         # [BT, BK] @ [BK, BV] -> [BT, BV]
         b_o += tl.dot(b_q, tl.trans(b_h))
         # [BT, BK] @ [BK, BT] -> [BT, BT]
@@ -130,7 +158,7 @@ def chunk_fwd_o(
     h: torch.Tensor,
     g: Optional[torch.Tensor] = None,  # cumsum of log decay
     scale: Optional[float] = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
     chunk_size: int = 64,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
@@ -148,6 +176,7 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
+    use_qk_l2norm = os.getenv("SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL", "0") == "1"
     chunk_fwd_kernel_o[grid](
         q,
         k,
@@ -164,10 +193,10 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
         BV=64,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm,
         num_warps=4,
         num_stages=2,
     )

@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 from typing import Optional
 
 import torch
@@ -29,6 +30,18 @@ if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_fwd import (
         chunk_gated_delta_rule_fwd_intra,
     )
+
+# 方案 1.5：当此开关打开时，``l2norm_fwd(q)`` / ``l2norm_fwd(k)`` 不再
+# 单独 launch ``l2norm_fwd_kernel``，而是把 L2 归一化交给
+# ``chunk_fwd_kkt_solve_kernel`` / ``recompute_w_u_fwd_kernel`` /
+# ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` / ``chunk_fwd_kernel_o``
+# 四个 chunk kernel 在自己内部完成（与 decode 路径 ``fused_recurrent_*``
+# 现有的 in-kernel Q/K L2 归一化保持一致）。
+#
+# **本开关默认关闭**——原行为完全保持，线上出问题 unset 即可回滚。
+_USE_L2NORM_IN_KERNEL = (
+    os.getenv("SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL", "0") == "1"
+)
 
 CHUNK_SIZE = 64
 
@@ -106,8 +119,14 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         k_orig = k
 
         if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
+            # 方案 1.5：当 ``SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL=1`` 时，
+            # 不再单独 launch ``l2norm_fwd_kernel``，而是由下面 4 个 chunk
+            # kernel 自己在 ``tl.load`` 之后完成 L2 归一化。
+            # ``use_qk_l2norm_in_kernel=True`` 仍是 caller 的诉求（与 decode
+            # 路径同名参数保持一致），只是归一化换了个执行点。
+            if not _USE_L2NORM_IN_KERNEL:
+                q = l2norm_fwd(q)
+                k = l2norm_fwd(k)
 
         chunk_indices = (
             prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)

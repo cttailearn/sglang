@@ -76,6 +76,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
+    USE_K_L2NORM_IN_KERNEL: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -247,28 +248,101 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 b_h4 *= exp(b_gk_last4)[None, :]
         b_v = b_v.to(k.dtype.element_ty)
 
+        # 方案 1.5：in-kernel K L2 归一化。delta_h 跟其他 chunk kernel
+        # 不同：K 在 64-wide 块里分多次 tl.load（因为 H state 也按 64 分块），
+        # 不像 ``chunk_o`` / ``recompute_w_u`` 那样能一次 tl.load 拿整行，
+        # 所以这里采用 2-pass：先扫一遍 K 算 sum_sq，再真正使用 K 时
+        # 乘以 rstd。多一次 K 读取是 in-kernel l2norm 在该 kernel 上
+        # 不可避免的代价。
+        if USE_K_L2NORM_IN_KERNEL:
+            b_k1_pre = tl.load(
+                tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+                ),
+                boundary_check=(0, 1),
+            )
+            b_k_sq = tl.sum(
+                b_k1_pre.to(tl.float32) * b_k1_pre.to(tl.float32), axis=0
+            )
+            if K > 64:
+                b_k2_pre = tl.load(
+                    tl.make_block_ptr(
+                        k,
+                        (K, T),
+                        (1, stride_k),
+                        (64, i_t * BT),
+                        (64, BT),
+                        (0, 1),
+                    ),
+                    boundary_check=(0, 1),
+                )
+                b_k_sq += tl.sum(
+                    b_k2_pre.to(tl.float32) * b_k2_pre.to(tl.float32), axis=0
+                )
+            if K > 128:
+                b_k3_pre = tl.load(
+                    tl.make_block_ptr(
+                        k,
+                        (K, T),
+                        (1, stride_k),
+                        (128, i_t * BT),
+                        (64, BT),
+                        (0, 1),
+                    ),
+                    boundary_check=(0, 1),
+                )
+                b_k_sq += tl.sum(
+                    b_k3_pre.to(tl.float32) * b_k3_pre.to(tl.float32), axis=0
+                )
+            if K > 192:
+                b_k4_pre = tl.load(
+                    tl.make_block_ptr(
+                        k,
+                        (K, T),
+                        (1, stride_k),
+                        (192, i_t * BT),
+                        (64, BT),
+                        (0, 1),
+                    ),
+                    boundary_check=(0, 1),
+                )
+                b_k_sq += tl.sum(
+                    b_k4_pre.to(tl.float32) * b_k4_pre.to(tl.float32), axis=0
+                )
+            b_k_rstd = 1.0 / tl.sqrt(b_k_sq + 1e-6)  # [BT]
+        else:
+            b_k_rstd = None  # placeholder; not used
+
         p_k = tl.make_block_ptr(
             k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
+        if USE_K_L2NORM_IN_KERNEL:
+            b_k = (b_k.to(tl.float32) * b_k_rstd[None, :]).to(b_k.dtype)
         b_h1 += tl.trans(tl.dot(b_k, b_v))
         if K > 64:
             p_k = tl.make_block_ptr(
                 k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
+            if USE_K_L2NORM_IN_KERNEL:
+                b_k = (b_k.to(tl.float32) * b_k_rstd[None, :]).to(b_k.dtype)
             b_h2 += tl.trans(tl.dot(b_k, b_v))
         if K > 128:
             p_k = tl.make_block_ptr(
                 k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
+            if USE_K_L2NORM_IN_KERNEL:
+                b_k = (b_k.to(tl.float32) * b_k_rstd[None, :]).to(b_k.dtype)
             b_h3 += tl.trans(tl.dot(b_k, b_v))
         if K > 192:
             p_k = tl.make_block_ptr(
                 k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
+            if USE_K_L2NORM_IN_KERNEL:
+                b_k = (b_k.to(tl.float32) * b_k_rstd[None, :]).to(b_k.dtype)
             b_h4 += tl.trans(tl.dot(b_k, b_v))
 
     # epilogue
@@ -328,6 +402,11 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
+    # 方案 1.5：把 ``l2norm_fwd`` 调用从 ``chunk.py`` 拉进来时，
+    # ``delta_h`` 是唯一仍然需要 K 已经 l2norm 过的 kernel。
+    # 其余 3 个 chunk kernel（kkt_solve / recompute_w_u / chunk_o）都
+    # 接受未归一化 K 并在内部完成 l2norm。
+    use_k_l2norm = os.getenv("SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL", "0") == "1"
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
@@ -352,6 +431,7 @@ def chunk_gated_delta_rule_fwd_h(
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
+        USE_K_L2NORM_IN_KERNEL=use_k_l2norm,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
     )
     return h, v_new

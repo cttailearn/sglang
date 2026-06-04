@@ -1,6 +1,8 @@
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/chunk_fwd.py
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -12,6 +14,25 @@ from sglang.srt.layers.attention.fla.utils import (
     is_tf32_supported,
 )
 from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
+
+# 方案 1.5（in-kernel Q/K l2norm）：开启后，``chunk.py`` 不再单独调用
+# ``l2norm_fwd(q)`` / ``l2norm_fwd(k)``，而是把 L2 归一化融合进各个 chunk
+# kernel 内部（与 decode 路径 ``fused_recurrent_*`` 的做法一致）。这样
+# 在 prefill 阶段可以省掉 ``l2norm_fwd_kernel`` 的 288 次 launch。
+#
+# **本开关默认关闭**——原行为完全保持，线上若出问题 unset 即可回滚。
+#
+# 注意：
+#  * 该选项生效时，所有消费 K 的 chunk kernel 会强制把 ``BK`` 设为
+#    ``next_power_of_2(K)``，以便在单次 ``tl.load`` 之内完成 L2 归约。
+#    对 Qwen3.5-4B（K=128）来说 BK=128，原 BK=32/64 的 autotune
+#    会被这条路径跳过。
+#  * 与 ``fused_gdn_gating_v2`` 的 ``SGLANG_FUSE_GDN_GATING`` 开关相互独立：
+#    ``SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL=1`` 单独即可省掉
+#    ``l2norm_fwd_kernel``；两者同时开可叠加。
+_USE_L2NORM_IN_KERNEL = (
+    os.getenv("SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL", "0") == "1"
+)
 
 # TF32 for the block-merge dot products (16x16 matmuls) is safe and ~2x faster on SM90.
 # The numerically sensitive forward-substitution uses scalar ops, not tl.dot.
@@ -25,15 +46,22 @@ else:
     {
         "USE_G": lambda args: args["g"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        # 方案 1.5：开启时把 BK 强制为 next_power_of_2(K)，以保证
+        # in-kernel K L2 归一化能在单次 tl.load 内完成归约。
+        # 否则维持与原版一致的默认 BK=64。
+        "BK": lambda args: (
+            max(64, triton.next_power_of_2(args["K"]))
+            if args.get("USE_K_L2NORM_IN_KERNEL", False)
+            else 64
+        ),
     }
 )
 @triton.autotune(
     configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps)
-        for BK in [32, 64]
+        triton.Config({}, num_warps=num_warps)
         for num_warps in [1, 2, 4]
     ],
-    key=["H", "Hg", "K", "BC"],
+    key=["H", "Hg", "K", "BC", "USE_K_L2NORM_IN_KERNEL"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -53,6 +81,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     BK: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_K_L2NORM_IN_KERNEL: tl.constexpr,
 ):
     """
     Fused kernel: compute beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass.
@@ -143,6 +172,15 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
             k, (T, K), (Hg * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
         )
         b_k0 = tl.load(p_k0, boundary_check=(0, 1))
+        # 方案 1.5：in-kernel K L2 归一化。仅当 BK == K 时单次 tl.load
+        # 就能覆盖整行；本 kernel 在 USE_K_L2NORM_IN_KERNEL=True 时由
+        # 顶层的 ``BK`` heuristic 强制 BK = next_power_of_2(K)。
+        if USE_K_L2NORM_IN_KERNEL:
+            b_k0_f32 = b_k0.to(tl.float32)
+            b_k0 = (
+                b_k0_f32
+                / tl.sqrt(tl.sum(b_k0_f32 * b_k0_f32, axis=1, keep_dims=True) + 1e-6)
+            ).to(b_k0.dtype)
         # diagonal block 0
         b_A00 += tl.dot(b_k0, tl.trans(b_k0))
 
@@ -151,6 +189,12 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
                 k, (T, K), (Hg * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0)
             )
             b_k1 = tl.load(p_k1, boundary_check=(0, 1))
+            if USE_K_L2NORM_IN_KERNEL:
+                b_k1_f32 = b_k1.to(tl.float32)
+                b_k1 = (
+                    b_k1_f32
+                    / tl.sqrt(tl.sum(b_k1_f32 * b_k1_f32, axis=1, keep_dims=True) + 1e-6)
+                ).to(b_k1.dtype)
             # diagonal block 1
             b_A11 += tl.dot(b_k1, tl.trans(b_k1))
             # off-diagonal (1,0)
@@ -161,6 +205,12 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
                     k, (T, K), (Hg * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0)
                 )
                 b_k2 = tl.load(p_k2, boundary_check=(0, 1))
+                if USE_K_L2NORM_IN_KERNEL:
+                    b_k2_f32 = b_k2.to(tl.float32)
+                    b_k2 = (
+                        b_k2_f32
+                        / tl.sqrt(tl.sum(b_k2_f32 * b_k2_f32, axis=1, keep_dims=True) + 1e-6)
+                    ).to(b_k2.dtype)
                 # diagonal block 2
                 b_A22 += tl.dot(b_k2, tl.trans(b_k2))
                 # off-diagonal (2,0), (2,1)
@@ -172,6 +222,12 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
                         k, (T, K), (Hg * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0)
                     )
                     b_k3 = tl.load(p_k3, boundary_check=(0, 1))
+                    if USE_K_L2NORM_IN_KERNEL:
+                        b_k3_f32 = b_k3.to(tl.float32)
+                        b_k3 = (
+                            b_k3_f32
+                            / tl.sqrt(tl.sum(b_k3_f32 * b_k3_f32, axis=1, keep_dims=True) + 1e-6)
+                        ).to(b_k3.dtype)
                     # diagonal block 3
                     b_A33 += tl.dot(b_k3, tl.trans(b_k3))
                     # off-diagonal (3,0), (3,1), (3,2)
@@ -401,6 +457,7 @@ def chunk_gated_delta_rule_fwd_intra(
         K=K,
         BT=BT,
         BC=BC,
+        USE_K_L2NORM_IN_KERNEL=_USE_L2NORM_IN_KERNEL,
     )
 
     # Step 2: recompute_w_u
