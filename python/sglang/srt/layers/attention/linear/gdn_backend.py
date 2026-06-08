@@ -1,4 +1,3 @@
-import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -56,37 +55,15 @@ elif is_cpu():
 
 
 # ---------------------------------------------------------------------------
-# 方案 1 融合：在 CUDA 上，可选用一份把 `g` 的 L2 归一化融合进 gating
-# kernel 本身的 Triton kernel。
-#
-# 本开关由环境变量 ``SGLANG_FUSE_GDN_GATING`` 控制，**默认行为不变**。
-# 设置为 ``1`` 即可启用。
-#
-# kernel 实现请见
-# ``sglang/srt/layers/attention/fla/fused_gdn_gating_v2.py``，
-# 设计说明请见对应文档。
+# 方案 1（在 chunk kernel 内做 Q/K L2 归一化）的 dispatcher 决策点
+# 见 ``chunk.py`` 里的 ``ChunkGatedDeltaRuleFunction.forward``。
+# 这里的 ``fused_gdn_gating`` 是控制 GDN 门控的 Triton kernel，与 Q/K
+# L2 归一化是两个独立的优化（参见 ``docs/developer_guide/fused_gdn_gating_v2_plan1.md``）。
 # ---------------------------------------------------------------------------
-if is_cuda() and __import__("os").getenv("SGLANG_FUSE_GDN_GATING", "0") == "1":
-    from sglang.srt.layers.attention.fla.fused_gdn_gating_v2 import (
-        fused_gdn_gating as _fused_gdn_gating_impl,
-    )
-    _fused_gdn_gating_variant = "v2 (fused L2 norm into gating kernel)"
-else:
+if is_cuda():
     from sglang.srt.layers.attention.fla.fused_gdn_gating import (
-        fused_gdn_gating as _fused_gdn_gating_impl,
+        fused_gdn_gating,
     )
-    _fused_gdn_gating_variant = "v1 (baseline)"
-
-fused_gdn_gating = _fused_gdn_gating_impl
-
-# 在 backend 加载时打印一次，方便用户确认是否真正启用了融合。
-# 注意：该分支语句是在 ``gdn_backend`` 被 import 时执行，但
-# ``GDNAttnBackend`` 的 __init__（即模型加载阶段）会再次 import 这一模块，
-# 实际看到这条日志说明 dispatcher 选好了实现。
-rank0_log(
-    f"[fused_gdn_gating] using {_fused_gdn_gating_variant} "
-    f"(SGLANG_FUSE_GDN_GATING={os.getenv('SGLANG_FUSE_GDN_GATING', '0')})"
-)
 
 
 class GDNKernelDispatcher:
@@ -321,15 +298,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         # 显式日志：模型加载阶段（__init__）一定打印，方便用户一眼确认
-        # GDN 后端以及当前 fused_gdn_gating 实现是否被实际启用。
+        # GDN 后端是否走"方案 1"的 in-kernel Q/K L2 归一化路径。
+        import os
         rank0_log(
             "[GDNAttnBackend] initialized "
             f"decode={self.kernel_dispatcher.decode_kernel.__class__.__name__}, "
             f"prefill={self.kernel_dispatcher.extend_kernel.__class__.__name__}, "
             f"verify={self.kernel_dispatcher.verify_kernel.__class__.__name__}, "
             f"packed_decode={self.kernel_dispatcher.supports_packed_decode}, "
-            f"fused_gdn_gating={_fused_gdn_gating_variant} "
-            f"(SGLANG_FUSE_GDN_GATING={os.getenv('SGLANG_FUSE_GDN_GATING', '0')}), "
             f"in_kernel_qk_l2norm="
             f"{os.getenv('SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL', '0')} "
             f"(SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL)"
