@@ -377,6 +377,7 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
+    do_in_kernel_l2norm: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -402,11 +403,9 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    # 方案 1.5：把 ``l2norm_fwd`` 调用从 ``chunk.py`` 拉进来时，
-    # ``delta_h`` 是唯一仍然需要 K 已经 l2norm 过的 kernel。
-    # 其余 3 个 chunk kernel（kkt_solve / recompute_w_u / chunk_o）都
-    # 接受未归一化 K 并在内部完成 l2norm。
-    use_k_l2norm = os.getenv("SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL", "0") == "1"
+    # 方案 1.5：delta_h 是唯一采用 2-pass in-kernel L2 的 chunk kernel
+    # ——因为 K 按 64-wide 块多次 tl.load。``do_in_kernel_l2norm`` 由
+    # ``chunk.py`` 传入，**不**从 env var 读。
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
@@ -431,7 +430,7 @@ def chunk_gated_delta_rule_fwd_h(
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
-        USE_K_L2NORM_IN_KERNEL=use_k_l2norm,
+        USE_K_L2NORM_IN_KERNEL=do_in_kernel_l2norm,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
     )
     return h, v_new

@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -138,6 +137,7 @@ def recompute_w_u_fwd(
     A: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor],
     chunk_indices: torch.LongTensor | None = None,
+    do_in_kernel_l2norm: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
@@ -147,7 +147,6 @@ def recompute_w_u_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BV = 64
-    use_k_l2norm = os.getenv("SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL", "0") == "1"
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
@@ -168,7 +167,7 @@ def recompute_w_u_fwd(
         BT=BT,
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
-        USE_K_L2NORM_IN_KERNEL=use_k_l2norm,
+        USE_K_L2NORM_IN_KERNEL=do_in_kernel_l2norm,
         num_warps=4,
         num_stages=3,
     )

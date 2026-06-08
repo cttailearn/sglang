@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import os
 from typing import Optional
 
 import torch
@@ -160,6 +159,7 @@ def chunk_fwd_o(
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     chunk_size: int = 64,
+    do_in_kernel_l2norm: bool = False,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -176,7 +176,9 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    use_qk_l2norm = os.getenv("SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL", "0") == "1"
+    # 方案 1.5：``do_in_kernel_l2norm`` 由 ``chunk.py`` 传入，**不**从
+    # env var 读——caller 的 ``use_qk_l2norm_in_kernel`` 才是 source
+    # of truth。
     chunk_fwd_kernel_o[grid](
         q,
         k,
@@ -196,7 +198,7 @@ def chunk_fwd_o(
         BV=64,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm,
+        USE_QK_L2NORM_IN_KERNEL=do_in_kernel_l2norm,
         num_warps=4,
         num_stages=2,
     )

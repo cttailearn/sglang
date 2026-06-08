@@ -57,6 +57,7 @@ def chunk_gated_delta_rule_fwd(
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
+    do_in_kernel_l2norm: bool = False,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -70,6 +71,7 @@ def chunk_gated_delta_rule_fwd(
         beta=beta,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        do_in_kernel_l2norm=do_in_kernel_l2norm,
     )
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
@@ -81,6 +83,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        do_in_kernel_l2norm=do_in_kernel_l2norm,
     )
     o = chunk_fwd_o(
         q=q,
@@ -90,6 +93,8 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        chunk_size=CHUNK_SIZE,
+        do_in_kernel_l2norm=do_in_kernel_l2norm,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
@@ -133,6 +138,12 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             if cu_seqlens is not None
             else None
         )
+        # ``do_in_kernel_l2norm`` = caller 想要 Q/K L2 归一化 **且** env var
+        # 打开了 in-kernel 路径。这是下游 4 个 kernel 真正用来决定
+        # ``USE_K_L2NORM_IN_KERNEL`` / ``USE_QK_L2NORM_IN_KERNEL`` constexpr
+        # 的布尔值——caller 意图是 source of truth，env var 只决定
+        # "wrapper 做还是 in-kernel 做"。
+        do_in_kernel_l2norm = use_qk_l2norm_in_kernel and _USE_L2NORM_IN_KERNEL
         g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -144,6 +155,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            do_in_kernel_l2norm=do_in_kernel_l2norm,
         )
         return o.to(q.dtype), h
 

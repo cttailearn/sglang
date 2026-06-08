@@ -22,17 +22,18 @@ from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
 #
 # **本开关默认关闭**——原行为完全保持，线上若出问题 unset 即可回滚。
 #
+# 重要：这里的 constexpr (``USE_K_L2NORM_IN_KERNEL``) 来自
+# ``chunk_gated_delta_rule_fwd_intra`` 的入参 ``do_in_kernel_l2norm``，
+# 而**不**是从 env var 读。env var 的决定权只在 ``chunk.py`` 里——
+# 它负责把 caller 的意图 (use_qk_l2norm_in_kernel) 与 in-kernel 开关
+# (env var) 合并后，作为参数传下来。这样保证 env var 不会"越权"让
+# caller 明确说不要 l2norm 的模型被强制注入归一化。
+#
 # 注意：
 #  * 该选项生效时，所有消费 K 的 chunk kernel 会强制把 ``BK`` 设为
 #    ``next_power_of_2(K)``，以便在单次 ``tl.load`` 之内完成 L2 归约。
 #    对 Qwen3.5-4B（K=128）来说 BK=128，原 BK=32/64 的 autotune
 #    会被这条路径跳过。
-#  * 与 ``fused_gdn_gating_v2`` 的 ``SGLANG_FUSE_GDN_GATING`` 开关相互独立：
-#    ``SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL=1`` 单独即可省掉
-#    ``l2norm_fwd_kernel``；两者同时开可叠加。
-_USE_L2NORM_IN_KERNEL = (
-    os.getenv("SGLANG_FUSE_L2NORM_INTO_CHUNK_KERNEL", "0") == "1"
-)
 
 # TF32 for the block-merge dot products (16x16 matmuls) is safe and ~2x faster on SM90.
 # The numerically sensitive forward-substitution uses scalar ops, not tl.dot.
@@ -400,6 +401,7 @@ def chunk_gated_delta_rule_fwd_intra(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
+    do_in_kernel_l2norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""
     GDN intra-chunk forward: fused kkt + solve_tril + recompute_w_u.
@@ -427,6 +429,12 @@ def chunk_gated_delta_rule_fwd_intra(
             The chunk size. Default: 64.
         chunk_indices (torch.LongTensor):
             Precomputed chunk indices. Default: `None`.
+        do_in_kernel_l2norm (bool):
+            方案 1.5：是否让下游 2 个 Triton kernel (kkt_solve,
+            recompute_w_u) 在 ``tl.load`` 之后立即做 K L2 归一化。
+            caller 通过 ``chunk.py`` 计算好此值并传入；**不**从 env
+            var 读——caller 的 ``use_qk_l2norm_in_kernel`` 才是
+            "做不做 l2norm" 的 source of truth。
 
     Returns:
         w (torch.Tensor): shape `[B, T, H, K]`
@@ -457,7 +465,7 @@ def chunk_gated_delta_rule_fwd_intra(
         K=K,
         BT=BT,
         BC=BC,
-        USE_K_L2NORM_IN_KERNEL=_USE_L2NORM_IN_KERNEL,
+        USE_K_L2NORM_IN_KERNEL=do_in_kernel_l2norm,
     )
 
     # Step 2: recompute_w_u
@@ -469,5 +477,6 @@ def chunk_gated_delta_rule_fwd_intra(
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        do_in_kernel_l2norm=do_in_kernel_l2norm,
     )
     return w, u, A
