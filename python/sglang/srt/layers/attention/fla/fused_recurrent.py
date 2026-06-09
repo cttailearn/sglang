@@ -402,6 +402,435 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     return out, initial_state
 
 
+# =============================================================================
+# Fused Conv1d (causal) + Gated Delta Rule packed-decode kernel.
+#
+# Motivation (see analysis report):
+#   - In Qwen3-Next / Qwen3.5 the GDN decode path launches two back-to-back
+#     kernels: ``causal_conv1d_update`` writes the conv1d output back to HBM,
+#     then ``fused_recurrent_gated_delta_rule_packed_decode`` re-reads it.
+#   - For batch=1, seq=1 (typical decode) the conv1d output is a small
+#     ``[B, conv_dim]`` tensor (e.g. 12288*2B = 24KB for Qwen3.5-9B), but the
+#     per-kernel launch overhead and HBM round-trip are the dominant cost.
+#   - This kernel computes the conv1d(+silu) on-the-fly inside the recurrent
+#     update, eliminating the intermediate write/read.
+#
+# Implementation notes:
+#   - Grid: ``(NV, B * HV)`` -- one program per (i_n, i_hv, v_block).
+#   - The conv1d state is updated in-place. V heads have disjoint channel
+#     ranges, so every program can safely update its V-slice. Q/K channels
+#     are shared by ``HEAD_RATIO = HV // H`` V heads, so we elect the first
+#     V head in each group (``i_hv == i_h * HEAD_RATIO``) to update them.
+#   - The conv1d output is the same layout as ``mixed_qkv`` in the original
+#     kernel -- ``[Q (H*K) | K (H*K) | V (HV*V)]`` per token -- so the rest of
+#     the gated-delta-rule math is unchanged.
+# =============================================================================
+
+
+@triton.jit
+def fused_conv1d_gated_delta_rule_packed_decode_kernel(
+    # Pre-conv1d input
+    mixed_qkv,                # [B, conv_dim] -- BEFORE conv1d
+    # Conv1d state and parameters
+    conv_state,               # [num_slots, conv_dim, state_len]
+    conv_weights,             # [conv_dim, kernel_size]
+    conv_bias,                # [conv_dim] or None
+    # Delta-rule per-token inputs
+    a,                        # [B, HV]
+    b,                        # [B, HV]
+    A_log,                    # [HV]
+    dt_bias,                  # [HV]
+    # Outputs
+    o,                        # [B, 1, HV, V]
+    h0,                       # [num_slots, HV, V, K]
+    ht,                       # [num_slots, HV, V, K]
+    # Indices
+    ssm_state_indices,        # [B]
+    # Scale
+    scale,
+    # Strides
+    stride_mixed_qkv_tok,
+    stride_a_tok,
+    stride_b_tok,
+    stride_init_state_token,
+    stride_final_state_token,
+    stride_indices_seq,
+    stride_conv_state_slot,    # = conv_dim * state_len
+    stride_conv_state_dim,     # = state_len
+    # Constexpr
+    HAS_BIAS: tl.constexpr,
+    ACTIVATION: tl.constexpr,  # "silu" or "none"
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    CONV_DIM: tl.constexpr,
+    KERNEL_SIZE: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    HEAD_RATIO: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    SOFTPLUS_THRESHOLD: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+):
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // HEAD_RATIO
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_v[:, None] & mask_k[None, :]
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
+    p_o = o + (i_n * HV + i_hv) * V + o_v
+
+    if state_idx < 0:
+        zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
+        tl.store(p_o, zero, mask=mask_v)
+        return
+
+    # Load SSM state for this (n, hv) -- [BV, BK]
+    p_h0 = h0 + state_idx * stride_init_state_token
+    p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    # Conv1d input (pre-conv) for this token
+    p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
+    p_cs = conv_state + state_idx * stride_conv_state_slot  # base for this request
+
+    # Channel offsets for the Q/K/V slices we need
+    # Layout: conv_state[ch, slot], mixed_qkv[ch]
+    # Conv1d output (silu(conv1d)) has the same layout as mixed_qkv in the
+    # non-fused path: [Q (H*K) | K (H*K) | V (HV*V)]
+    Q_CH_OFFS = i_h * K + o_k
+    K_CH_OFFS = H * K + i_h * K + o_k
+    V_CH_OFFS = 2 * H * K + i_hv * V + o_v
+
+    # ---- Compute Q via conv1d+silu ----
+    # State slice for Q: [BK, STATE_LEN]
+    x_q_state = tl.load(
+        p_cs + Q_CH_OFFS[:, None] * stride_conv_state_dim + tl.arange(0, STATE_LEN)[None, :],
+        mask=mask_k[:, None],
+        other=0.0,
+    )
+    # Weight slice for Q: [BK, KERNEL_SIZE]
+    w_q = tl.load(
+        conv_weights + Q_CH_OFFS[:, None] * KERNEL_SIZE + tl.arange(0, KERNEL_SIZE)[None, :],
+        mask=mask_k[:, None],
+        other=0.0,
+    )
+    # New x for Q: [BK]
+    x_q_new = tl.load(p_mixed + Q_CH_OFFS, mask=mask_k, other=0.0)
+    # Conv1d: w[0] is for the oldest state, w[KERNEL_SIZE-1] is for the newest
+    # (the just-arrived token). The input column ordering is col0=oldest.
+    b_q_conv = w_q[:, KERNEL_SIZE - 1] * x_q_new
+    for ki in tl.static_range(STATE_LEN):
+        b_q_conv += w_q[:, ki] * x_q_state[:, ki]
+    if HAS_BIAS:
+        b_q_conv += tl.load(conv_bias + Q_CH_OFFS, mask=mask_k, other=0.0)
+    if ACTIVATION == "silu":
+        b_q_conv = b_q_conv * tl.sigmoid(b_q_conv)
+    b_q = b_q_conv.to(tl.float32)
+
+    # ---- Compute K via conv1d+silu ----
+    x_k_state = tl.load(
+        p_cs + K_CH_OFFS[:, None] * stride_conv_state_dim + tl.arange(0, STATE_LEN)[None, :],
+        mask=mask_k[:, None],
+        other=0.0,
+    )
+    w_k = tl.load(
+        conv_weights + K_CH_OFFS[:, None] * KERNEL_SIZE + tl.arange(0, KERNEL_SIZE)[None, :],
+        mask=mask_k[:, None],
+        other=0.0,
+    )
+    x_k_new = tl.load(p_mixed + K_CH_OFFS, mask=mask_k, other=0.0)
+    b_k_conv = w_k[:, KERNEL_SIZE - 1] * x_k_new
+    for ki in tl.static_range(STATE_LEN):
+        b_k_conv += w_k[:, ki] * x_k_state[:, ki]
+    if HAS_BIAS:
+        b_k_conv += tl.load(conv_bias + K_CH_OFFS, mask=mask_k, other=0.0)
+    if ACTIVATION == "silu":
+        b_k_conv = b_k_conv * tl.sigmoid(b_k_conv)
+    b_k = b_k_conv.to(tl.float32)
+
+    # ---- Compute V via conv1d+silu ----
+    x_v_state = tl.load(
+        p_cs + V_CH_OFFS[:, None] * stride_conv_state_dim + tl.arange(0, STATE_LEN)[None, :],
+        mask=mask_v[:, None],
+        other=0.0,
+    )
+    w_v = tl.load(
+        conv_weights + V_CH_OFFS[:, None] * KERNEL_SIZE + tl.arange(0, KERNEL_SIZE)[None, :],
+        mask=mask_v[:, None],
+        other=0.0,
+    )
+    x_v_new = tl.load(p_mixed + V_CH_OFFS, mask=mask_v, other=0.0)
+    b_v_conv = w_v[:, KERNEL_SIZE - 1] * x_v_new
+    for ki in tl.static_range(STATE_LEN):
+        b_v_conv += w_v[:, ki] * x_v_state[:, ki]
+    if HAS_BIAS:
+        b_v_conv += tl.load(conv_bias + V_CH_OFFS, mask=mask_v, other=0.0)
+    if ACTIVATION == "silu":
+        b_v_conv = b_v_conv * tl.sigmoid(b_v_conv)
+    b_v = b_v_conv.to(tl.float32)
+
+    # ---- Update conv_state ----
+    # The new state is a left-shift of the old state with the freshly arrived
+    # token appended at the END. Concretely:
+    #   new_state[ch, 0]   = old_state[ch, 1]
+    #   new_state[ch, 1]   = old_state[ch, 2]
+    #   ...
+    #   new_state[ch, S-2] = old_state[ch, S-1]
+    #   new_state[ch, S-1] = x_new
+    # The old values for Q/K are in x_q_state / x_k_state, for V in x_v_state.
+    # We have already used them for the conv1d above, so we can overwrite
+    # the conv_state in place.
+    if STATE_LEN > 0:
+        # V channels: disjoint across i_hv, safe to write from every program.
+        p_cs_v_dst = p_cs + V_CH_OFFS * stride_conv_state_dim
+        for s in tl.static_range(STATE_LEN - 1):
+            tl.store(p_cs_v_dst + s, x_v_state[:, s + 1], mask=mask_v)
+        tl.store(p_cs_v_dst + (STATE_LEN - 1), x_v_new, mask=mask_v)
+
+        # Q/K channels: shared by HEAD_RATIO V heads. Elect one program per
+        # (i_n, i_h) group to perform the write. We choose the V head with
+        # the lowest i_hv in the group, i.e. i_hv == i_h * HEAD_RATIO.
+        if i_hv == i_h * HEAD_RATIO:
+            p_cs_q_dst = p_cs + Q_CH_OFFS * stride_conv_state_dim
+            for s in tl.static_range(STATE_LEN - 1):
+                tl.store(p_cs_q_dst + s, x_q_state[:, s + 1], mask=mask_k)
+            tl.store(p_cs_q_dst + (STATE_LEN - 1), x_q_new, mask=mask_k)
+
+            p_cs_k_dst = p_cs + K_CH_OFFS * stride_conv_state_dim
+            for s in tl.static_range(STATE_LEN - 1):
+                tl.store(p_cs_k_dst + s, x_k_state[:, s + 1], mask=mask_k)
+            tl.store(p_cs_k_dst + (STATE_LEN - 1), x_k_new, mask=mask_k)
+
+    # ---- Apply L2 norm (optional) and scale ----
+    if USE_QK_L2NORM_IN_KERNEL:
+        b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+    b_q = b_q * scale
+
+    # ---- Gating parameters ----
+    a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
+    b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
+    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    x = a_val + dt_bias_val
+    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+    g_val = -tl.exp(A_log_val) * softplus_x
+    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+
+    # ---- Delta rule (same as fused_recurrent_gated_delta_rule_packed_decode) ----
+    b_h *= exp(g_val)
+    b_v -= tl.sum(b_h * b_k[None, :], 1)
+    b_v *= beta_val
+    b_h += b_v[:, None] * b_k[None, :]
+    b_o = tl.sum(b_h * b_q[None, :], 1)
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+    # ---- Write final state ----
+    p_ht = ht + state_idx * stride_final_state_token
+    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+
+
+def fused_conv1d_gated_delta_rule_packed_decode(
+    mixed_qkv: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_bias: Optional[torch.Tensor],
+    activation: str,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool = False,
+    kernel_size: int = 4,
+) -> torch.Tensor:
+    """Fused causal Conv1d (+ optional activation) + Gated Delta Rule packed-decode.
+
+    Compared with calling ``causal_conv1d_update`` followed by
+    ``fused_recurrent_gated_delta_rule_packed_decode``:
+
+    - The intermediate conv1d output is **never written to HBM** -- it is
+      computed on-the-fly inside the recurrent kernel from the conv state
+      slice and the conv weights, and consumed by the delta rule in the
+      same program.
+    - The conv state is still updated in-place; V heads have disjoint
+      channel ranges, so every program can update its V-slice. For Q/K,
+      only the V head with the lowest ``i_hv`` in its ``HEAD_RATIO``-group
+      performs the write to avoid races.
+
+    Args:
+        mixed_qkv: ``[B, conv_dim]`` -- conv1d **input** (i.e. the output of
+            ``in_proj_qkvz``), not the post-conv1d tensor.
+        conv_state: ``[num_slots, conv_dim, state_len]`` -- rolling history.
+        conv_weights: ``[conv_dim, kernel_size]``.
+        conv_bias: ``[conv_dim]`` or ``None``.
+        activation: ``"silu"`` / ``"swish"`` / ``"none"`` (only ``"silu"`` and
+            ``"none"`` are exercised in production; ``"swish"`` is treated as
+            silu to match the existing ``causal_conv1d_update`` behavior).
+        a, b: ``[B, HV]`` delta-rule per-token inputs.
+        A_log, dt_bias: ``[HV]`` SSM parameters.
+        scale: attention scale (typically ``head_k_dim ** -0.5``).
+        initial_state: ``[num_slots, HV, V, K]`` SSM state pool.
+        out: ``[B, 1, HV, V]`` output buffer.
+        ssm_state_indices: ``[B]`` per-request slot indices.
+        use_qk_l2norm_in_kernel: whether to apply L2 norm to Q/K in-kernel.
+        kernel_size: conv1d kernel size (state_len = kernel_size - 1).
+
+    Returns:
+        ``out`` (``[B, 1, HV, V]``) -- same tensor as the input argument.
+    """
+    if activation not in ("silu", "swish", "none", None):
+        raise NotImplementedError(
+            f"activation must be one of silu/swish/none, got {activation!r}"
+        )
+    if activation in (None, "none"):
+        activation_constexpr = "none"
+    else:
+        activation_constexpr = "silu"
+
+    if not mixed_qkv.is_contiguous():
+        raise ValueError("`mixed_qkv` must be contiguous.")
+    if conv_weights.stride(-1) != 1:
+        raise ValueError("`conv_weights` must be contiguous in the last dim.")
+
+    B = mixed_qkv.shape[0]
+    conv_dim = mixed_qkv.shape[1]
+    if conv_weights.shape[0] != conv_dim:
+        raise ValueError(
+            f"conv_weights.shape[0]={conv_weights.shape[0]} != conv_dim={conv_dim}."
+        )
+    if conv_weights.shape[1] != kernel_size:
+        raise ValueError(
+            f"conv_weights.shape[1]={conv_weights.shape[1]} != kernel_size={kernel_size}."
+        )
+
+    if conv_state.shape[1] != conv_dim:
+        raise ValueError(
+            f"conv_state.shape[1]={conv_state.shape[1]} != conv_dim={conv_dim}."
+        )
+    state_len = kernel_size - 1
+    if conv_state.shape[2] != state_len:
+        raise ValueError(
+            f"conv_state.shape[2]={conv_state.shape[2]} != kernel_size-1={state_len}."
+        )
+    if conv_state.stride(-1) != 1:
+        raise ValueError("`conv_state` must be contiguous in the last dim.")
+
+    if conv_bias is not None and conv_bias.shape != (conv_dim,):
+        raise ValueError(
+            f"conv_bias.shape={tuple(conv_bias.shape)} != ({conv_dim},)."
+        )
+
+    if not out.is_contiguous():
+        raise ValueError("`out` must be contiguous.")
+    if initial_state.ndim != 4:
+        raise ValueError(
+            f"`initial_state` must be a 4D tensor (got ndim={initial_state.ndim})."
+        )
+    if initial_state.stride(-1) != 1:
+        raise ValueError("`initial_state` must be contiguous in the last dim.")
+
+    HV, V, K = initial_state.shape[-3:]
+    if a.shape != (B, HV) or b.shape != (B, HV):
+        raise ValueError(
+            f"a/b must have shape ({B}, {HV}); got {tuple(a.shape)}/{tuple(b.shape)}."
+        )
+    if A_log.numel() != HV or dt_bias.numel() != HV:
+        raise ValueError("A_log and dt_bias must have HV elements.")
+    if out.shape != (B, 1, HV, V):
+        raise ValueError(
+            f"`out` must have shape {(B, 1, HV, V)} (got {tuple(out.shape)})."
+        )
+
+    # Infer H, HEAD_RATIO from the post-conv layout
+    #   conv_dim = 2 * H * K + HV * V
+    #   (mixed_qkv post-conv layout = [Q(H*K) | K(H*K) | V(HV*V)])
+    qk_dim = conv_dim - HV * V
+    if qk_dim <= 0 or qk_dim % 2 != 0:
+        raise ValueError(
+            f"Invalid conv_dim={conv_dim} for HV={HV}, V={V}."
+        )
+    q_dim = qk_dim // 2
+    if q_dim % K != 0:
+        raise ValueError(f"Invalid Q size {q_dim}: must be divisible by K={K}.")
+    H = q_dim // K
+    if H <= 0 or HV % H != 0:
+        raise ValueError(
+            f"Invalid head config inferred from conv_dim: H={H}, HV={HV}."
+        )
+    HEAD_RATIO = HV // H
+
+    BK = triton.next_power_of_2(K)
+    if triton.cdiv(K, BK) != 1:
+        raise ValueError(
+            f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
+        )
+    BV = min(triton.next_power_of_2(V), 32)
+
+    stride_mixed_qkv_tok = mixed_qkv.stride(0)
+    stride_a_tok = a.stride(0)
+    stride_b_tok = b.stride(0)
+    stride_init_state_token = initial_state.stride(0)
+    stride_final_state_token = initial_state.stride(0)
+    stride_indices_seq = ssm_state_indices.stride(0)
+    stride_conv_state_slot = conv_state.stride(0)
+    stride_conv_state_dim = conv_state.stride(1)
+
+    NV = triton.cdiv(V, BV)
+    grid = (NV, B * HV)
+    fused_conv1d_gated_delta_rule_packed_decode_kernel[grid](
+        mixed_qkv=mixed_qkv,
+        conv_state=conv_state,
+        conv_weights=conv_weights,
+        conv_bias=conv_bias,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        o=out,
+        h0=initial_state,
+        ht=initial_state,
+        ssm_state_indices=ssm_state_indices,
+        scale=scale,
+        stride_mixed_qkv_tok=stride_mixed_qkv_tok,
+        stride_a_tok=stride_a_tok,
+        stride_b_tok=stride_b_tok,
+        stride_init_state_token=stride_init_state_token,
+        stride_final_state_token=stride_final_state_token,
+        stride_indices_seq=stride_indices_seq,
+        stride_conv_state_slot=stride_conv_state_slot,
+        stride_conv_state_dim=stride_conv_state_dim,
+        HAS_BIAS=conv_bias is not None,
+        ACTIVATION=activation_constexpr,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        CONV_DIM=conv_dim,
+        KERNEL_SIZE=kernel_size,
+        STATE_LEN=state_len,
+        HEAD_RATIO=HEAD_RATIO,
+        BK=BK,
+        BV=BV,
+        SOFTPLUS_THRESHOLD=20.0,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        num_warps=1,
+        num_stages=3,
+    )
+    return out, initial_state
+
+
 @triton.jit
 def fused_recurrent_kda_packed_decode_kernel(
     mixed_qkv,

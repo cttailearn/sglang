@@ -20,6 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
+from sglang.srt.environ import envs
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -141,12 +142,16 @@ class GDNKernelDispatcher:
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
         )
+        self.supports_fused_conv1d_packed_decode = getattr(
+            self.decode_kernel, "supports_fused_conv1d_packed_decode", False
+        )
 
         rank0_log(
             f"GDN kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"extend={self.extend_kernel.__class__.__name__}, "
             f"verify={self.verify_kernel.__class__.__name__} "
-            f"packed_decode={self.supports_packed_decode}"
+            f"packed_decode={self.supports_packed_decode} "
+            f"fused_conv1d_packed_decode={self.supports_fused_conv1d_packed_decode}"
         )
 
     def packed_decode(
@@ -179,6 +184,59 @@ class GDNKernelDispatcher:
             cache_indices=cache_indices,
             num_v_heads=num_v_heads,
             head_v_dim=head_v_dim,
+            **kwargs,
+        )
+
+    def fused_conv1d_packed_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_bias: Optional[torch.Tensor],
+        activation: str,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        scale: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_v_heads: int,
+        head_v_dim: int,
+        kernel_size: int = 4,
+        **kwargs,
+    ) -> Optional[torch.Tensor]:
+        """Attempt fused (causal-conv1d + gated-delta-rule) packed decode.
+
+        Returns the output tensor if the decode kernel supports the fused
+        path, otherwise ``None`` so the caller can fall back to the
+        ``causal_conv1d_update`` + ``packed_decode`` sequence.
+
+        Controlled by env var ``SGLANG_FUSE_GDN_CONV1D_DECODE=1`` (default
+        0 = off).  When set to 1 the fused kernel eliminates one kernel
+        launch and one HBM round-trip per GDN decode step.
+        """
+        if not self.supports_fused_conv1d_packed_decode:
+            return None
+        if not envs.SGLANG_FUSE_GDN_CONV1D_DECODE.get():
+            return None
+        return self.decode_kernel.fused_conv1d_packed_decode(
+            mixed_qkv,
+            conv_state,
+            conv_weights,
+            conv_bias,
+            activation,
+            a,
+            b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            kernel_size=kernel_size,
             **kwargs,
         )
 
@@ -314,6 +372,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
+
+        # ---- Fast path: fused Causal Conv1d + Gated Delta Rule ----
+        # Combines ``causal_conv1d_update`` and ``packed_decode`` into a
+        # single Triton kernel, avoiding one HBM round-trip and one kernel
+        # launch. The conv1d(+silu) is computed on-the-fly inside the
+        # recurrent kernel from the conv state and conv weights, and the
+        # conv state is updated in-place.
+        if self.kernel_dispatcher.supports_fused_conv1d_packed_decode:
+            core_attn_out = self.kernel_dispatcher.fused_conv1d_packed_decode(
+                # NOTE: pass mixed_qkv *before* conv1d; the kernel computes
+                # conv1d internally.
+                mixed_qkv=mixed_qkv,
+                conv_state=conv_states,
+                conv_weights=layer.conv_weights,
+                conv_bias=layer.bias,
+                activation=layer.activation,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                scale=layer.head_k_dim**-0.5,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                num_v_heads=layer.num_v_heads,
+                head_v_dim=layer.head_v_dim,
+                kernel_size=layer.conv_kernel_size,
+            )
+            if core_attn_out is not None:
+                self._track_mamba_state_decode(
+                    forward_batch, conv_states, ssm_states, cache_indices
+                )
+                return core_attn_out
+            # If the fused kernel refused (shouldn't happen for the Triton
+            # backend, but defensive), fall through to the standard path.
+
+        # ---- Standard path: conv1d_update then packed_decode ----
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
